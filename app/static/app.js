@@ -141,14 +141,29 @@
 
   /* ---------- login ---------- */
 
+  const WAKING = 'The server is waking up. It sleeps when idle, so this can take up to a minute.';
+
+  // A free host sleeps when idle. Ping /health as soon as the sign-in page opens, so the wake-up
+  // starts while the visitor is still typing, and say so if it is slow.
+  function warmUp(status) {
+    const slow = setTimeout(() => { if (!status.textContent) status.textContent = WAKING; }, 2500);
+    fetch(BASE + '/health', { cache: 'no-store' })
+      .then((r) => { if (r.ok && status.textContent === WAKING) status.textContent = ''; })
+      .catch(() => { if (status.textContent === WAKING) status.textContent = 'Cannot reach the server yet. Try again in a moment.'; })
+      .finally(() => clearTimeout(slow));
+  }
+
   function renderLogin(message) {
     stopTimers();
     const input = h('input', { type: 'password', id: 'tok', name: 'token', autocomplete: 'current-password', required: true, 'aria-describedby': 'tok-hint' });
     const err = h('p', { class: 'field-error', role: 'alert', text: message || '' });
     const btn = h('button', { class: 'btn primary', type: 'submit', text: 'Continue' });
+    const status = h('p', { class: 'hint', role: 'status', 'aria-live': 'polite' });
     const form = h('form', { onsubmit: async (e) => {
       e.preventDefault();
       btn.disabled = true;
+      btn.textContent = 'Signing in...';
+      status.textContent = 'Contacting the server. If it was idle, waking it can take up to a minute.';
       err.textContent = '';
       token = input.value.trim();
       try {
@@ -156,7 +171,12 @@
         store.set(token);
         start();
       } catch (ex) {
-        if (ex.message !== 'unauthorized') { err.textContent = 'Could not reach the server: ' + ex.message; btn.disabled = false; }
+        if (ex.message !== 'unauthorized') {
+          err.textContent = 'Could not reach the server: ' + ex.message;
+          btn.disabled = false;
+          btn.textContent = 'Continue';
+          status.textContent = '';
+        }
       }
     } },
       h('h1', { text: 'Research Desk' }),
@@ -166,10 +186,12 @@
         input,
         h('p', { class: 'hint', id: 'tok-hint', text: 'Ask whoever runs this server. It is kept only until you close this tab.' }),
         err),
-      btn);
+      btn,
+      status);
     app.replaceChildren(h('main', { id: 'main', class: 'login' }, form));
     document.title = 'Sign in | Research Desk';
     input.focus();
+    warmUp(status);
   }
 
   /* ---------- shell ---------- */
