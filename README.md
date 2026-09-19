@@ -96,7 +96,8 @@ Open only ports 80 and 443. Point the domain's DNS at the VM before first start.
 | `GET /runs/{id}` | Status; `gate` holds what the human is being asked |
 | `POST /runs/{id}/approve {"approved": true}` | Answer a gate. Reject with `{"approved": false, "feedback": "..."}`; optional `topic` / `thesis` edits |
 | `POST /runs/{id}/retry` | Re-queue a failed run; it resumes from its checkpoint |
-| `POST /runs/{id}/cancel` | Cancel an active run |
+| `POST /runs/{id}/cancel` | Cancel an active run. The worker stops before its next step |
+| `DELETE /runs/{id}` | Permanently delete a paper and its saved progress. An active run must be cancelled first (409 otherwise) |
 | `GET /runs/{id}/draft` | Finished paper as Markdown |
 | `GET /runs` | List papers, newest first |
 | `GET /health` | Liveness and database check (no auth) |

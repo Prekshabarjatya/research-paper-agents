@@ -92,6 +92,7 @@
       } catch { /* keep statusText */ }
       throw new Error(detail);
     }
+    if (res.status === 204) return null;
     return res.json();
   }
 
@@ -209,7 +210,7 @@
 
   async function loadRuns() {
     clearTimeout(S.listTimer);
-    if (!document.hidden) {
+    if (!document.hidden || S.runs === null) {  // background tabs pause polling, but still load once
       try {
         S.runs = await api('/runs');
         renderRail();
@@ -338,7 +339,7 @@
   async function loadRun(id, focus) {
     clearTimeout(S.runTimer);
     if (S.runId !== id) return;
-    if (!document.hidden) {
+    if (!document.hidden || !S.run) {  // background tabs pause polling, but still load once
       try {
         const run = await api('/runs/' + id);
         if (S.runId !== id) return;
@@ -406,11 +407,13 @@
         h('span', { class: 'name', text: name }), h('span', { class: 'cap', text: caps[i] }))));
 
     const canCancel = ['queued', 'running', 'awaiting_approval'].includes(r.status);
+    const canDelete = ['completed', 'failed', 'cancelled', 'awaiting_approval'].includes(r.status);
     const actions = h('div', { class: 'run-actions' },
       r.status === 'failed' && h('button', { class: 'btn primary', type: 'button', text: 'Retry', onclick: () => act('retry') }),
       canCancel && h('button', { class: 'btn danger', type: 'button', text: 'Cancel run', onclick: () => {
         if (confirm('Cancel this run? Work done so far is kept, but it will not continue.')) act('cancel');
-      } }));
+      } }),
+      canDelete && h('button', { class: 'btn danger', type: 'button', text: 'Delete paper', onclick: removeRun }));
 
     const head = h('header', { class: 'run-head' },
       h('h1', { class: 'run-title', id: 'run-title', tabindex: '-1', text: title }),
@@ -440,6 +443,21 @@
       if (ex.message !== 'unauthorized') toast(ex.message, 'error');
       throw ex;
     }
+  }
+
+  async function removeRun() {
+    const id = S.runId;
+    if (!confirm('Delete this paper permanently? The draft, activity log and saved progress are removed. This cannot be undone.')) return;
+    try {
+      await api('/runs/' + id, { method: 'DELETE' });
+    } catch (ex) {
+      if (ex.message !== 'unauthorized') toast(ex.message, 'error');
+      return;
+    }
+    S.runs = (S.runs || []).filter((r) => r.id !== id);
+    toast('Paper deleted.');
+    location.hash = '#/new';
+    loadRuns();
   }
 
   /* ---------- approval gates ---------- */

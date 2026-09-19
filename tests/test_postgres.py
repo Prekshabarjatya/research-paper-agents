@@ -122,3 +122,32 @@ def test_progress_appends_and_list_returns_compact_rows_newest_first(store):
     rows = store.list()
     assert [r["id"] for r in rows] == [b["id"], a["id"]]
     assert rows[1]["result"] == {"topic": "T", "needs_human_review": False}  # draft is not shipped in the list
+
+
+def _checkpoint_rows(pool, run_id):
+    with pool.connection() as conn:
+        return sum(conn.execute(f"SELECT count(*) AS n FROM {t} WHERE thread_id=%s", (run_id,)).fetchone()["n"]
+                   for t in ("checkpoints", "checkpoint_blobs", "checkpoint_writes"))
+
+
+def test_delete_removes_the_run_and_all_of_its_saved_graph_state(pool, store):
+    llm = FakeLLM(script())
+    run = store.create(PROMPT)
+    other = store.create(PROMPT + " keep me")
+    graph = make_graph(pool, llm)
+    drain(store, graph)                                   # both runs now hold checkpoints
+    assert _checkpoint_rows(pool, run["id"]) > 0 and _checkpoint_rows(pool, other["id"]) > 0
+    assert store.delete(run["id"])
+    assert store.get(run["id"]) is None
+    assert _checkpoint_rows(pool, run["id"]) == 0          # the content is really gone
+    assert store.get(other["id"]) is not None and _checkpoint_rows(pool, other["id"]) > 0  # neighbours untouched
+
+
+def test_delete_refuses_an_active_run_and_missing_checkpoint_tables_are_fine(pool, store):
+    active = store.create(PROMPT)                           # queued
+    assert not store.delete(active["id"])
+    assert store.get(active["id"]) is not None
+    store.cancel(active["id"])
+    with pool.connection() as conn:                         # a fresh DB where the worker never ran
+        conn.execute("DROP TABLE IF EXISTS checkpoints, checkpoint_blobs, checkpoint_writes, checkpoint_migrations")
+    assert store.delete(active["id"])

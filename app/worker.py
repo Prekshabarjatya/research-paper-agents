@@ -29,17 +29,19 @@ def _pending_gate(snap):
     return None
 
 
-def _drive(graph, payload, cfg, on_progress) -> None:
-    """Run the graph, reporting each finished node so the UI can show live progress."""
+def _drive(graph, payload, cfg, on_progress, should_stop=None) -> None:
+    """Run the graph, reporting each finished node so the UI can show live progress.
+    Stops between steps once should_stop() says the run was cancelled or deleted."""
     for chunk in graph.stream(payload, cfg, stream_mode="updates"):
-        if on_progress is None:
-            continue
-        for node, update in chunk.items():
-            if node != "__interrupt__" and isinstance(update, dict):
-                on_progress(node, update)
+        if on_progress is not None:
+            for node, update in chunk.items():
+                if node != "__interrupt__" and isinstance(update, dict):
+                    on_progress(node, update)
+        if should_stop is not None and should_stop():
+            return
 
 
-def advance(graph, run: dict, on_progress=None) -> None:
+def advance(graph, run: dict, on_progress=None, should_stop=None) -> None:
     """Move the graph forward from wherever the checkpoint says it is.
 
     Decides from checkpointed state, not from the run's status, so it is correct
@@ -47,13 +49,13 @@ def advance(graph, run: dict, on_progress=None) -> None:
     cfg = _cfg(run["id"])
     snap = graph.get_state(cfg)
     if not snap.values and not snap.next:
-        _drive(graph, {"prompt": run["prompt"]}, cfg, on_progress)
+        _drive(graph, {"prompt": run["prompt"]}, cfg, on_progress, should_stop)
     elif _pending_gate(snap) is not None:
         if run.get("resume") is None:
             return  # still waiting on the human; caller re-reads the gate
-        _drive(graph, Command(resume=run["resume"]), cfg, on_progress)
+        _drive(graph, Command(resume=run["resume"]), cfg, on_progress, should_stop)
     elif snap.next:
-        _drive(graph, None, cfg, on_progress)  # crashed mid-run: continue from the last checkpoint
+        _drive(graph, None, cfg, on_progress, should_stop)  # crashed mid-run: continue from the last checkpoint
 
 
 def summarize(values: dict) -> dict:
@@ -94,6 +96,11 @@ def process(store: RunStore, graph, run: dict) -> None:
             store.heartbeat(run["id"])
 
     threading.Thread(target=beat, daemon=True).start()
+
+    def gone_or_cancelled() -> bool:
+        row = store.get(run["id"])
+        return row is None or row["status"] == "cancelled"
+
     def on_progress(node: str, update: dict) -> None:
         entry = {"node": node, "log": update.get("log", []),
                  "at": datetime.now(UTC).isoformat(timespec="seconds")}
@@ -103,7 +110,16 @@ def process(store: RunStore, graph, run: dict) -> None:
         store.add_progress(run["id"], entry)
 
     try:
-        advance(graph, run, on_progress)
+        advance(graph, run, on_progress, gone_or_cancelled)
+        if gone_or_cancelled():
+            # Cancelled or deleted while working: record nothing. If it was deleted, the step that was
+            # in flight may have written a checkpoint after the delete, so remove that too.
+            if store.get(run["id"]) is None:
+                try:
+                    graph.checkpointer.delete_thread(run["id"])
+                except Exception:
+                    log.warning("run %s: could not clear leftover checkpoint", run["id"], exc_info=True)
+            return
         snap = graph.get_state(_cfg(run["id"]))
         gate = _pending_gate(snap)
         if gate is not None:

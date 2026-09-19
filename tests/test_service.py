@@ -289,3 +289,86 @@ def test_vercel_build_points_the_ui_at_the_api_and_allows_only_that_origin(tmp_p
     assert "connect-src 'self' https://desk-api.onrender.com;" in html and "unsafe-inline" not in html
     assert run({"API_BASE_URL": "http://insecure.example"}).returncode == 1   # https only
     assert run({}).returncode == 1                                              # must be set
+
+
+# ---- delete, and cancel that actually stops ----------------------------------
+
+def _finished_run(client, store):
+    graph = build_graph(FakeLLM(script()), tools(), MemorySaver())
+    run_id = client.post("/runs", json={"prompt": PROMPT}).json()["id"]
+    for _ in range(3):
+        drain(store, graph)
+        client.post(f"/runs/{run_id}/approve", json={"approved": True})
+    return run_id
+
+
+def test_delete_removes_a_finished_paper_and_needs_auth(client, store):
+    run_id = _finished_run(client, store)
+    assert client.get(f"/runs/{run_id}").json()["status"] == "completed"
+    assert TestClient(create_app(store)).delete(f"/runs/{run_id}").status_code == 401
+    assert client.delete(f"/runs/{run_id}").status_code == 204
+    assert client.get(f"/runs/{run_id}").status_code == 404
+    assert run_id not in [r["id"] for r in client.get("/runs").json()]
+    assert client.delete(f"/runs/{run_id}").status_code == 404  # already gone
+
+
+def test_an_active_run_must_be_cancelled_before_it_can_be_deleted(client):
+    run_id = client.post("/runs", json={"prompt": PROMPT}).json()["id"]        # queued
+    assert client.delete(f"/runs/{run_id}").status_code == 409
+    assert client.post(f"/runs/{run_id}/cancel").status_code == 200
+    assert client.delete(f"/runs/{run_id}").status_code == 204
+
+
+def test_a_run_waiting_on_you_can_be_deleted(client, store):
+    graph = build_graph(FakeLLM(script()), tools(), MemorySaver())
+    run_id = client.post("/runs", json={"prompt": PROMPT}).json()["id"]
+    drain(store, graph)
+    assert client.get(f"/runs/{run_id}").json()["status"] == "awaiting_approval"
+    assert client.delete(f"/runs/{run_id}").status_code == 204
+
+
+class CancelAfterFirstStep(MemoryRunStore):
+    """Simulates a user pressing Cancel while the first step is finishing."""
+
+    def add_progress(self, run_id, entry):
+        super().add_progress(run_id, entry)
+        if len(self._runs[run_id]["progress"]) == 1:
+            self.cancel(run_id)
+
+
+def test_cancel_stops_the_worker_before_it_spends_more_tokens():
+    store = CancelAfterFirstStep()
+    llm = FakeLLM(script())
+    graph = build_graph(llm, tools(), MemorySaver())
+    run = store.create(PROMPT)
+    drain(store, graph)
+    assert store.get(run["id"])["status"] == "cancelled"
+    assert llm.calls == ["analyst"]  # the topic step never ran
+
+
+class DeleteAfterFirstStep(MemoryRunStore):
+    def add_progress(self, run_id, entry):
+        super().add_progress(run_id, entry)
+        if len(self._runs[run_id]["progress"]) == 1:
+            self._runs[run_id]["status"] = "cancelled"
+            self.delete(run_id)  # cancel then delete while the worker is mid-step
+
+
+def test_deleting_mid_step_leaves_no_row_and_no_saved_progress():
+    store = DeleteAfterFirstStep()
+    llm = FakeLLM(script())
+    graph = build_graph(llm, tools(), MemorySaver())
+    run = store.create(PROMPT)
+    drain(store, graph)
+    assert store.get(run["id"]) is None
+    assert llm.calls == ["analyst"]
+    cfg = {"configurable": {"thread_id": run["id"]}}
+    assert not graph.get_state(cfg).values  # leftover checkpoint was cleared
+
+
+def test_cors_preflight_allows_delete_for_a_separately_hosted_ui(store, monkeypatch):
+    monkeypatch.setattr(settings, "cors_origins", "https://desk.vercel.app")
+    r = TestClient(create_app(store)).options("/runs/x", headers={
+        "Origin": "https://desk.vercel.app", "Access-Control-Request-Method": "DELETE",
+        "Access-Control-Request-Headers": "authorization"})
+    assert r.status_code == 200 and "DELETE" in r.headers["access-control-allow-methods"]

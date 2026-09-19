@@ -24,6 +24,7 @@ class RunStore(Protocol):
     def approve(self, run_id: str, decision: dict) -> bool: ...
     def retry(self, run_id: str) -> bool: ...
     def cancel(self, run_id: str) -> bool: ...
+    def delete(self, run_id: str) -> bool: ...
     def requeue_stale(self, older_than_seconds: float) -> int: ...
     def add_progress(self, run_id: str, entry: dict) -> None: ...
     def list(self, limit: int = 50) -> list[dict]: ...
@@ -72,13 +73,14 @@ class MemoryRunStore:
 
     def heartbeat(self, run_id):
         with self._lock:
-            self._runs[run_id]["heartbeat"] = time.time()
+            if run_id in self._runs:
+                self._runs[run_id]["heartbeat"] = time.time()
 
     def finish(self, run_id, status, *, gate=None, result=None, error=None):
         with self._lock:
-            r = self._runs[run_id]
-            if r["status"] == "cancelled":
-                return  # a cancel that raced with the worker wins
+            r = self._runs.get(run_id)
+            if r is None or r["status"] == "cancelled":
+                return  # deleted, or a cancel that raced with the worker: it wins
             r.update(status=status, gate=gate, result=result, error=error, updated_at=_now())
             if status != "running":
                 r["resume"] = None
@@ -107,6 +109,14 @@ class MemoryRunStore:
             r.update(status="cancelled", updated_at=_now())
             return True
 
+    def delete(self, run_id):
+        with self._lock:
+            r = self._runs.get(run_id)
+            if not r or r["status"] in ("queued", "running"):
+                return False  # an active run must be cancelled first
+            del self._runs[run_id]
+            return True
+
     def requeue_stale(self, older_than_seconds):
         cutoff = time.time() - older_than_seconds
         n = 0
@@ -119,7 +129,8 @@ class MemoryRunStore:
 
     def add_progress(self, run_id, entry):
         with self._lock:
-            self._runs[run_id]["progress"].append(entry)
+            if run_id in self._runs:
+                self._runs[run_id]["progress"].append(entry)
 
     def list(self, limit=50):
         with self._lock:
@@ -197,6 +208,25 @@ class PgRunStore:
     def cancel(self, run_id):
         return self._one("UPDATE runs SET status='cancelled', updated_at=now() "
                          "WHERE id=%s AND status = ANY(%s) RETURNING id", (run_id, list(ACTIVE))) is not None
+
+    def delete(self, run_id):
+        row = self._one("DELETE FROM runs WHERE id=%s AND status NOT IN ('queued', 'running') RETURNING id",
+                        (run_id,))
+        if row is None:
+            return False
+        self.purge_checkpoints(run_id)
+        return True
+
+    def purge_checkpoints(self, thread_id):
+        """Remove the run's saved graph state too, so deleting a paper really removes its content."""
+        import psycopg
+
+        with self.pool.connection() as conn:
+            for table in ("checkpoint_writes", "checkpoint_blobs", "checkpoints"):
+                try:
+                    conn.execute(f"DELETE FROM {table} WHERE thread_id = %s", (thread_id,))
+                except psycopg.errors.UndefinedTable:
+                    pass  # checkpoint tables are created by the worker on first start
 
     def requeue_stale(self, older_than_seconds):
         with self.pool.connection() as conn:

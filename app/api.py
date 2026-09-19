@@ -31,7 +31,7 @@ def create_app(store: RunStore) -> FastAPI:
     app = FastAPI(title="Research Paper Agents", docs_url=None, redoc_url=None)
     origins = [o.strip().rstrip("/") for o in settings.cors_origins.split(",") if o.strip()]
     if origins:  # only needed when the UI is hosted on a different origin (e.g. Vercel)
-        app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["GET", "POST"],
+        app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["GET", "POST", "DELETE"],
                            allow_headers=["Authorization", "Content-Type"], max_age=600)
 
     def auth(authorization: str = Header(default="")):
@@ -104,6 +104,13 @@ def create_app(store: RunStore) -> FastAPI:
         if not store.cancel(run_id):
             raise HTTPException(409, f"run is '{run['status']}' and cannot be cancelled")
         return _public(load(run_id))
+
+    @app.delete("/runs/{run_id}", status_code=204, dependencies=[Depends(auth)])
+    def delete_run(run_id: str):
+        run = load(run_id)
+        if not store.delete(run_id):
+            raise HTTPException(409, f"run is '{run['status']}'; cancel it before deleting")
+        return Response(status_code=204)
 
     @app.get("/runs/{run_id}/draft", dependencies=[Depends(auth)])
     def draft(run_id: str):
