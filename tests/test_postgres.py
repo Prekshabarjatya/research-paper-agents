@@ -111,3 +111,14 @@ def test_crash_mid_run_recovers_from_postgres_checkpoint(pool, store):
     drain(store, make_graph(pool, llm))
     assert store.get(run["id"])["gate"]["gate"] == "thesis"
     assert llm.calls.count("strategist") == 1
+
+
+def test_progress_appends_and_list_returns_compact_rows_newest_first(store):
+    a, b = store.create(PROMPT), store.create(PROMPT + " B")
+    store.add_progress(a["id"], {"node": "analyst", "log": ["x"], "at": "t1"})
+    store.add_progress(a["id"], {"node": "scout", "log": ["y"], "at": "t2"})
+    assert [p["node"] for p in store.get(a["id"])["progress"]] == ["analyst", "scout"]
+    store.finish(a["id"], "completed", result={"topic": "T", "needs_human_review": False, "draft": "big"})
+    rows = store.list()
+    assert [r["id"] for r in rows] == [b["id"], a["id"]]
+    assert rows[1]["result"] == {"topic": "T", "needs_human_review": False}  # draft is not shipped in the list

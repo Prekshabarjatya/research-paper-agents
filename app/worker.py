@@ -5,6 +5,7 @@ so a crash or deploy loses at most the node that was executing."""
 import logging
 import signal
 import threading
+from datetime import UTC, datetime
 
 import httpx
 from langgraph.types import Command
@@ -28,7 +29,17 @@ def _pending_gate(snap):
     return None
 
 
-def advance(graph, run: dict) -> None:
+def _drive(graph, payload, cfg, on_progress) -> None:
+    """Run the graph, reporting each finished node so the UI can show live progress."""
+    for chunk in graph.stream(payload, cfg, stream_mode="updates"):
+        if on_progress is None:
+            continue
+        for node, update in chunk.items():
+            if node != "__interrupt__" and isinstance(update, dict):
+                on_progress(node, update)
+
+
+def advance(graph, run: dict, on_progress=None) -> None:
     """Move the graph forward from wherever the checkpoint says it is.
 
     Decides from checkpointed state, not from the run's status, so it is correct
@@ -36,13 +47,13 @@ def advance(graph, run: dict) -> None:
     cfg = _cfg(run["id"])
     snap = graph.get_state(cfg)
     if not snap.values and not snap.next:
-        graph.invoke({"prompt": run["prompt"]}, cfg)
+        _drive(graph, {"prompt": run["prompt"]}, cfg, on_progress)
     elif _pending_gate(snap) is not None:
         if run.get("resume") is None:
             return  # still waiting on the human; caller re-reads the gate
-        graph.invoke(Command(resume=run["resume"]), cfg)
+        _drive(graph, Command(resume=run["resume"]), cfg, on_progress)
     elif snap.next:
-        graph.invoke(None, cfg)  # crashed mid-run: continue from the last checkpoint
+        _drive(graph, None, cfg, on_progress)  # crashed mid-run: continue from the last checkpoint
 
 
 def summarize(values: dict) -> dict:
@@ -60,6 +71,9 @@ def summarize(values: dict) -> dict:
     sources = values.get("sources", [])
     srcs = [Source.model_validate(x) for x in sources]
     return {
+        "topic": values.get("topic", ""),
+        "thesis": values.get("thesis", ""),
+        "constraints": values.get("constraints", {}),
         "draft": render_final(draft, srcs) if draft else "",
         "approved": approved,
         "needs_human_review": not approved,
@@ -80,8 +94,16 @@ def process(store: RunStore, graph, run: dict) -> None:
             store.heartbeat(run["id"])
 
     threading.Thread(target=beat, daemon=True).start()
+    def on_progress(node: str, update: dict) -> None:
+        entry = {"node": node, "log": update.get("log", []),
+                 "at": datetime.now(UTC).isoformat(timespec="seconds")}
+        for key in ("topic", "thesis"):  # lets the UI title the run before it finishes
+            if update.get(key):
+                entry[key] = update[key]
+        store.add_progress(run["id"], entry)
+
     try:
-        advance(graph, run)
+        advance(graph, run, on_progress)
         snap = graph.get_state(_cfg(run["id"]))
         gate = _pending_gate(snap)
         if gate is not None:
@@ -114,7 +136,8 @@ def run_forever(store: RunStore, graph, stop: threading.Event | None = None) -> 
         process(store, graph, run)
 
 
-def main() -> None:
+def build_worker():
+    """Connect to Postgres, prepare tables, and assemble the graph. Returns (store, graph)."""
     from langgraph.checkpoint.postgres import PostgresSaver
     from psycopg.rows import dict_row
     from psycopg_pool import ConnectionPool
@@ -126,7 +149,6 @@ def main() -> None:
     from app.nodes import Tools
     from app.store import PgRunStore
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     pool = ConnectionPool(settings.database_url, min_size=1, max_size=4, open=True,
                           kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row})
     store = PgRunStore(pool)
@@ -136,8 +158,12 @@ def main() -> None:
 
     http = httpx.Client(headers={"User-Agent": "research-paper-agents/0.1"})
     tools = Tools(search=lambda q: search_all(q, http), verify=lambda s: verify_source(s, http))
-    graph = build_graph(RoutedLLM(build_providers()), tools, saver)
+    return store, build_graph(RoutedLLM(build_providers()), tools, saver)
 
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    store, graph = build_worker()
     stop = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: stop.set())  # finish the current run, then exit

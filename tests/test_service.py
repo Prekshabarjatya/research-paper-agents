@@ -188,3 +188,104 @@ def test_capped_run_returns_the_best_draft_not_the_last_one(store, monkeypatch):
     assert result["open_issues"] == ["thin argument"]           # the LLM critic's issues for v2
     assert "word word word" not in result["draft"]              # v3's overlong text is not returned
     assert summarize(graph.get_state({"configurable": {"thread_id": run["id"]}}).values)["draft"]
+
+
+# ---- run list, live progress, UI hosting ------------------------------------
+
+def test_worker_records_progress_per_node_while_running(store):
+    graph = build_graph(FakeLLM(script()), tools(), MemorySaver())
+    run = store.create(PROMPT)
+    drain(store, graph)
+    progress = store.get(run["id"])["progress"]
+    assert [p["node"] for p in progress] == ["analyst", "propose_topic"]
+    assert progress[1]["log"] and progress[1]["at"].endswith("+00:00")
+
+
+def test_list_runs_is_compact_newest_first_and_authenticated(client, store):
+    first = client.post("/runs", json={"prompt": PROMPT}).json()["id"]
+    second = client.post("/runs", json={"prompt": PROMPT + " Second."}).json()["id"]
+    rows = client.get("/runs").json()
+    assert [r["id"] for r in rows] == [second, first]
+    assert set(rows[0]) == {"id", "status", "prompt", "topic", "needs_human_review", "created_at", "updated_at"}
+    assert TestClient(create_app(store)).get("/runs").status_code == 401
+
+
+def test_completed_summary_carries_topic_thesis_and_constraints(client, store):
+    graph = build_graph(FakeLLM(script()), tools(), MemorySaver())
+    run_id = client.post("/runs", json={"prompt": PROMPT}).json()["id"]
+    for _ in range(3):
+        drain(store, graph)
+        client.post(f"/runs/{run_id}/approve", json={"approved": True})
+    body = client.get(f"/runs/{run_id}").json()
+    assert body["result"]["topic"] == "AI routing" and "cuts cost" in body["result"]["thesis"]
+    assert client.get("/runs").json()[0]["topic"] == "AI routing"
+
+
+def test_ui_is_served_at_root_with_strict_security_headers(client):
+    r = client.get("/")
+    assert r.status_code == 200 and "Research Desk" in r.text
+    csp = r.headers["content-security-policy"]
+    assert "script-src 'self'" in csp and "unsafe-inline" not in csp and "frame-ancestors 'none'" in csp
+    assert r.headers["x-content-type-options"] == "nosniff"
+    assert client.get("/health").headers["content-security-policy"]  # API responses too
+
+
+def test_memory_store_timestamps_match_postgres_format(store):
+    run = store.create(PROMPT)
+    assert str(run["created_at"]).endswith("+00:00")  # real datetimes, like Postgres, not raw epoch floats
+    assert str(store.get(run["id"])["updated_at"]).endswith("+00:00")
+
+
+def test_progress_carries_the_proposed_topic_so_the_ui_can_title_the_run(store):
+    graph = build_graph(FakeLLM(script(strategist={"topic": "AI‑routing study", "search_queries": ["q"]})),
+                        tools(), MemorySaver())
+    run = store.create(PROMPT)
+    drain(store, graph)
+    with_topic = [p for p in store.get(run["id"])["progress"] if p.get("topic")]
+    assert with_topic and with_topic[0]["topic"] == "AI-routing study"  # typography normalised too
+
+
+# ---- hosted deploy pieces ---------------------------------------------------
+
+def test_cors_allows_only_the_configured_ui_origin(store, monkeypatch):
+    monkeypatch.setattr(settings, "cors_origins", "https://desk.vercel.app/")
+    c = TestClient(create_app(store))
+    ok = c.options("/runs", headers={"Origin": "https://desk.vercel.app", "Access-Control-Request-Method": "POST",
+                                      "Access-Control-Request-Headers": "authorization,content-type"})
+    assert ok.status_code == 200 and ok.headers["access-control-allow-origin"] == "https://desk.vercel.app"
+    bad = c.options("/runs", headers={"Origin": "https://evil.example", "Access-Control-Request-Method": "POST"})
+    assert "access-control-allow-origin" not in bad.headers
+
+
+def test_no_cors_headers_by_default(store, monkeypatch):
+    monkeypatch.setattr(settings, "cors_origins", "")
+    r = TestClient(create_app(store)).get("/health", headers={"Origin": "https://desk.vercel.app"})
+    assert "access-control-allow-origin" not in r.headers
+
+
+def test_ui_config_is_served_and_defaults_to_same_origin(client):
+    r = client.get("/config.js")
+    assert r.status_code == 200 and 'RD_API_BASE = ""' in r.text
+
+
+def test_vercel_build_points_the_ui_at_the_api_and_allows_only_that_origin(tmp_path):
+    import shutil
+    import subprocess
+    from pathlib import Path
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not installed")
+    root = Path(__file__).resolve().parent.parent
+    work = tmp_path / "repo"
+    shutil.copytree(root / "app" / "static", work / "app" / "static")
+    (work / "scripts").mkdir()
+    shutil.copy(root / "scripts" / "vercel_build.mjs", work / "scripts")
+    run = lambda env: subprocess.run([node, "scripts/vercel_build.mjs"], cwd=work, env=env,
+                                     capture_output=True, text=True, check=False)
+    good = run({"API_BASE_URL": "https://desk-api.onrender.com/"})
+    assert good.returncode == 0, good.stderr
+    assert (work / "dist" / "config.js").read_text() == 'window.RD_API_BASE = "https://desk-api.onrender.com";\n'
+    html = (work / "dist" / "index.html").read_text()
+    assert "connect-src 'self' https://desk-api.onrender.com;" in html and "unsafe-inline" not in html
+    assert run({"API_BASE_URL": "http://insecure.example"}).returncode == 1   # https only
+    assert run({}).returncode == 1                                              # must be set

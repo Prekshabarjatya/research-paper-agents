@@ -76,7 +76,7 @@ def make_strategist(llm: LLM):
             TopicProposal, tier="fast", purpose="strategist",
         )
         return {
-            "topic": p.topic, "search_queries": p.search_queries, "tokens_used": tok,
+            "topic": clean_typography(p.topic), "search_queries": p.search_queries, "tokens_used": tok,
             "log": [f"strategist: proposed '{p.topic}'"],
         }
 
@@ -143,7 +143,7 @@ def make_thesis(llm: LLM):
             + (f"\nThe previous thesis was rejected. Feedback: {fb}" if fb else ""),
             tier="strong", purpose="thesis",
         )
-        return {"thesis": r.text, "tokens_used": r.tokens, "log": ["thesis: proposed"]}
+        return {"thesis": clean_typography(r.text), "tokens_used": r.tokens, "log": ["thesis: proposed"]}
 
     def approve_thesis(state):
         decision = interrupt({"gate": "thesis", "thesis": state["thesis"]})

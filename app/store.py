@@ -7,6 +7,7 @@ and doubles as the job queue via FOR UPDATE SKIP LOCKED."""
 import threading
 import time
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
@@ -24,11 +25,18 @@ class RunStore(Protocol):
     def retry(self, run_id: str) -> bool: ...
     def cancel(self, run_id: str) -> bool: ...
     def requeue_stale(self, older_than_seconds: float) -> int: ...
+    def add_progress(self, run_id: str, entry: dict) -> None: ...
+    def list(self, limit: int = 50) -> list[dict]: ...
     def ping(self) -> bool: ...
 
 
+def _now() -> datetime:
+    return datetime.now(UTC)
+
+
 class MemoryRunStore:
-    """Same semantics as PgRunStore, for tests and local hacking."""
+    """Same semantics as PgRunStore, for tests and local hacking. Timestamps are real datetimes,
+    like Postgres returns, so clients see identical formats."""
 
     def __init__(self):
         self._runs: dict[str, dict] = {}
@@ -36,8 +44,8 @@ class MemoryRunStore:
 
     def create(self, prompt):
         run = {"id": str(uuid.uuid4()), "status": "queued", "prompt": prompt, "gate": None,
-               "resume": None, "result": None, "error": None, "attempts": 0,
-               "heartbeat": None, "created_at": time.time(), "updated_at": time.time()}
+               "resume": None, "result": None, "error": None, "attempts": 0, "progress": [],
+               "heartbeat": None, "created_at": _now(), "updated_at": _now()}
         with self._lock:
             self._runs[run["id"]] = run
         return dict(run)
@@ -59,7 +67,7 @@ class MemoryRunStore:
                 return None
             r = queued[0]
             r.update(status="running", heartbeat=time.time(), attempts=r["attempts"] + 1,
-                     updated_at=time.time())
+                     updated_at=_now())
             return dict(r)
 
     def heartbeat(self, run_id):
@@ -71,7 +79,7 @@ class MemoryRunStore:
             r = self._runs[run_id]
             if r["status"] == "cancelled":
                 return  # a cancel that raced with the worker wins
-            r.update(status=status, gate=gate, result=result, error=error, updated_at=time.time())
+            r.update(status=status, gate=gate, result=result, error=error, updated_at=_now())
             if status != "running":
                 r["resume"] = None
 
@@ -80,7 +88,7 @@ class MemoryRunStore:
             r = self._runs.get(run_id)
             if not r or r["status"] != "awaiting_approval":
                 return False
-            r.update(status="queued", resume=decision, gate=None, updated_at=time.time())
+            r.update(status="queued", resume=decision, gate=None, updated_at=_now())
             return True
 
     def retry(self, run_id):
@@ -88,7 +96,7 @@ class MemoryRunStore:
             r = self._runs.get(run_id)
             if not r or r["status"] != "failed":
                 return False
-            r.update(status="queued", error=None, updated_at=time.time())
+            r.update(status="queued", error=None, updated_at=_now())
             return True
 
     def cancel(self, run_id):
@@ -96,7 +104,7 @@ class MemoryRunStore:
             r = self._runs.get(run_id)
             if not r or r["status"] not in ACTIVE:
                 return False
-            r.update(status="cancelled", updated_at=time.time())
+            r.update(status="cancelled", updated_at=_now())
             return True
 
     def requeue_stale(self, older_than_seconds):
@@ -108,6 +116,21 @@ class MemoryRunStore:
                     r["status"] = "queued"
                     n += 1
         return n
+
+    def add_progress(self, run_id, entry):
+        with self._lock:
+            self._runs[run_id]["progress"].append(entry)
+
+    def list(self, limit=50):
+        with self._lock:
+            rows = sorted(self._runs.values(), key=lambda r: r["created_at"], reverse=True)[:limit]
+            out = []
+            for r in rows:
+                res = r["result"] or {}
+                out.append({**{k: r[k] for k in ("id", "status", "prompt", "created_at", "updated_at")},
+                            "result": {"topic": res.get("topic"),
+                                       "needs_human_review": res.get("needs_human_review")}})
+            return out
 
     def ping(self):
         return True
@@ -181,6 +204,19 @@ class PgRunStore:
                 "UPDATE runs SET status='queued' WHERE status='running' "
                 "AND heartbeat < now() - make_interval(secs => %s)", (older_than_seconds,))
             return cur.rowcount
+
+    def add_progress(self, run_id, entry):
+        from psycopg.types.json import Jsonb
+        self._one("UPDATE runs SET progress = progress || %s WHERE id=%s RETURNING id",
+                  (Jsonb([entry]), run_id))
+
+    def list(self, limit=50):
+        with self.pool.connection() as conn:
+            return conn.execute(
+                """SELECT id, status, prompt, created_at, updated_at,
+                          jsonb_build_object('topic', result->'topic',
+                                             'needs_human_review', result->'needs_human_review') AS result
+                   FROM runs ORDER BY created_at DESC LIMIT %s""", (limit,)).fetchall()
 
     def ping(self):
         try:

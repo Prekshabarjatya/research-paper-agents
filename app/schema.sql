@@ -6,9 +6,11 @@ CREATE TABLE IF NOT EXISTS runs (
     resume      JSONB,              -- the human's decision, consumed by the worker
     result      JSONB,
     error       TEXT,
+    progress    JSONB NOT NULL DEFAULT '[]'::jsonb,
     attempts    INT NOT NULL DEFAULT 0,
     heartbeat   TIMESTAMPTZ,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS runs_status_created ON runs (status, created_at);
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS progress JSONB NOT NULL DEFAULT '[]'::jsonb;
