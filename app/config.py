@@ -30,6 +30,8 @@ class Settings(BaseSettings):
     # Service. The API refuses every route except /health until a token is set (fail closed).
     api_token: str = ""
     max_active_runs: int = 20
+    run_worker: bool = False         # run the worker inside the API process (one-service deploys)
+    cors_origins: str = ""           # comma-separated origins allowed to call the API (e.g. a Vercel UI)
     stale_run_seconds: int = 120     # a "running" run with no heartbeat this long is re-queued
     worker_poll_seconds: float = 2.0
 

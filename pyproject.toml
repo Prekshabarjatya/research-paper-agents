@@ -1,7 +1,7 @@
 [project]
 name = "research-paper-agents"
 version = "0.1.0"
-description = "Supervisor-style multi-agent pipeline (LangGraph) that turns an assignment into a cited research paper, with verified citations and human approval gates."
+description = "LangGraph workflow with specialist LLM roles that turns an assignment into a cited, literature-based paper, with verified citations, a web UI and human approval gates."
 requires-python = ">=3.11"
 dependencies = [
     "langgraph>=0.4",

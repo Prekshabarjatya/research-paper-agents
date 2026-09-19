@@ -1,12 +1,27 @@
 # Research Paper Agents
 
-A supervisor-style multi-agent pipeline (LangGraph) that turns an assignment into a cited
-research paper, run as a queued, resumable service.
+A multi-step LLM **workflow** (LangGraph) that turns an assignment into a cited, literature-based
+research paper, with a web UI, a job queue and human approval gates.
+
+**What it is, precisely.** Seven specialist steps (brief analyst, topic strategist, source scout,
+thesis writer, outliner, drafter, critic) share one state object and run along a fixed graph. Routing
+is deterministic code, not an LLM "supervisor": the only dynamic decisions are the human approvals and
+the critic's choice between "rewrite" and "find more sources". Source search and citation checking are
+plain code. That is a workflow with agent-style roles, not autonomous agents that choose their own tools.
+It was built that way on purpose: it is cheaper, testable, and fits free-tier rate limits.
 
 ```
-assignment → analyst → topic ▸ human gate → scout (OpenAlex/Semantic Scholar + Crossref check)
-           → thesis ▸ human gate → planner → writer → critic ⟲ (max 3 rounds) → paper
+assignment -> analyst -> topic (you approve) -> scout: OpenAlex/Semantic Scholar + Crossref check
+           -> thesis (you approve) -> planner -> writer -> critic, loop max N -> paper
 ```
+
+## What it is good for, and not
+
+- Good for: review papers, argumentative essays and term papers on topics with indexed literature.
+- Not for: original research (no experiments or data analysis), topics with few DOI-indexed papers,
+  books and non-English sources, or anything that needs full-text reading. Sources are read at
+  abstract level, so claims resting on details inside a paper need checking by you.
+- Output is a researched first draft to verify and rewrite, not a finished submission.
 
 ## Guarantees the code enforces
 
@@ -30,7 +45,32 @@ docker run -d --rm --name rpa-test-pg -e POSTGRES_USER=research -e POSTGRES_PASS
   -e POSTGRES_DB=research -p 55432:5432 postgres:16-alpine
 ```
 
-## Deploy (one VM)
+## Deploy
+
+### Render (backend, UI, worker and database)
+
+The `render.yaml` Blueprint creates one Docker web service (API, UI and worker in one process) and a
+Postgres database.
+
+1. Push this repo to GitHub. In Render choose New > Blueprint and select the repo.
+2. When prompted, enter `GROQ_API_KEY`. Render generates `API_TOKEN`: open the service's Environment tab
+   to read it. That token is the password you type on the sign-in screen.
+3. Open the service URL, sign in, and start a paper.
+
+Notes: confirm plan names and prices in the dashboard (they change). The `free` web plan spins down when
+idle, which pauses runs; use a paid plan for anything you depend on. Runs are checkpointed in Postgres, so a
+restart resumes a run once its heartbeat goes stale (about two minutes).
+
+### Vercel (optional: host the UI separately)
+
+Vercel serves only the static UI. It cannot run the worker or a database, so the API stays on Render.
+You do not need this: the Render service already serves the UI.
+
+1. On Render, set `CORS_ORIGINS` to your Vercel URL (for example `https://desk.vercel.app`).
+2. In Vercel, import the repo. The included `vercel.json` sets the build command and output folder.
+3. Add the environment variable `API_BASE_URL` = your Render URL (https only, no trailing slash) and deploy.
+
+### One VM with Docker Compose
 
 ```bash
 cp .env.example .env               # set GROQ_API_KEY, POSTGRES_PASSWORD, API_TOKEN, DOMAIN
@@ -49,6 +89,7 @@ Open only ports 80 and 443. Point the domain's DNS at the VM before first start.
 | `POST /runs/{id}/retry` | Re-queue a failed run; it resumes from its checkpoint |
 | `POST /runs/{id}/cancel` | Cancel an active run |
 | `GET /runs/{id}/draft` | Finished paper as Markdown |
+| `GET /runs` | List papers, newest first |
 | `GET /health` | Liveness and database check (no auth) |
 
 Statuses: `queued → running → awaiting_approval → queued → … → completed | failed | cancelled`.
