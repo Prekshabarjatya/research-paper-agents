@@ -5,3 +5,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .DS_Store
+.neon
+node_modules/
+.claude/
+skills-lock.json
