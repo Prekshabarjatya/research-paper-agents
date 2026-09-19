@@ -17,7 +17,7 @@ from app.store import PgRunStore
 log = logging.getLogger("main")
 
 _pool = ConnectionPool(settings.database_url, min_size=1, max_size=5, open=True,
-                       kwargs={"autocommit": True, "row_factory": dict_row})
+                       kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row})
 _store = PgRunStore(_pool)
 _store.init()  # before the worker thread starts, so the two never race to create tables
 app = create_app(_store)

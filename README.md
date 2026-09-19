@@ -47,19 +47,28 @@ docker run -d --rm --name rpa-test-pg -e POSTGRES_USER=research -e POSTGRES_PASS
 
 ## Deploy
 
-### Render (backend, UI, worker and database)
+### Render, free (backend, UI and worker) with a free external database
 
-The `render.yaml` Blueprint creates one Docker web service (API, UI and worker in one process) and a
-Postgres database.
+The `render.yaml` Blueprint creates one free Docker web service that runs the API, the UI and the worker in
+one process. The database is a free Postgres from Neon (or Supabase), because Render's own free database
+has historically expired after a limited period. Confirm current limits on both dashboards.
 
-1. Push this repo to GitHub. In Render choose New > Blueprint and select the repo.
-2. When prompted, enter `GROQ_API_KEY`. Render generates `API_TOKEN`: open the service's Environment tab
-   to read it. That token is the password you type on the sign-in screen.
-3. Open the service URL, sign in, and start a paper.
+1. Create a free Neon project and copy its **direct** (not pooled) connection string. It must include
+   `sslmode=require`.
+2. Push this repo to GitHub. In Render choose New > Blueprint and select the repo.
+3. When prompted, enter `DATABASE_URL` (the Neon string) and `GROQ_API_KEY`. Render generates `API_TOKEN`:
+   open the service's Environment tab to read it. That token is the password on the sign-in screen.
+4. Open the service URL, sign in, and start a paper.
 
-Notes: confirm plan names and prices in the dashboard (they change). The `free` web plan spins down when
-idle, which pauses runs; use a paid plan for anything you depend on. Runs are checkpointed in Postgres, so a
-restart resumes a run once its heartbeat goes stale (about two minutes).
+What the free tier costs you:
+
+- **The service sleeps after about 15 minutes without web traffic**, and the first request after that takes
+  around a minute to wake it. While you have the page open on a running paper, the UI polls the API, which
+  keeps it awake. If you close the tab mid-run, the run pauses when the service sleeps and resumes after it
+  wakes and the run's heartbeat goes stale (about two minutes). Nothing is lost, because runs are
+  checkpointed in Postgres.
+- Free instance hours are limited per month. Check the current allowance in Render.
+- For an always-on service, use a paid plan.
 
 ### Vercel (optional: host the UI separately)
 
